@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <stdint.h>
 #include <linux/ipsec.h>
 #include <linux/netlink.h>
@@ -344,6 +345,11 @@ struct private_kernel_netlink_ipsec_t {
 	 * Netlink xfrm socket to receive acquire and expire events
 	 */
 	int socket_xfrm_events;
+
+	/**
+	 * Whether the kernel correctly reports the last use time on SAs
+	 */
+	bool sa_use_time;
 
 	/**
 	 * Whether to install routes along policies
@@ -1169,7 +1175,8 @@ static bool receive_events(private_kernel_netlink_ipsec_t *this, int fd,
 METHOD(kernel_ipsec_t, get_features, kernel_feature_t,
 	private_kernel_netlink_ipsec_t *this)
 {
-	return KERNEL_ESP_V3_TFC | KERNEL_POLICY_SPI;
+	return KERNEL_ESP_V3_TFC | KERNEL_POLICY_SPI |
+			(this->sa_use_time ? KERNEL_SA_USE_TIME : 0);
 }
 
 /**
@@ -2150,7 +2157,7 @@ static void get_replay_state(private_kernel_netlink_ipsec_t *this,
 METHOD(kernel_ipsec_t, query_sa, status_t,
 	private_kernel_netlink_ipsec_t *this, kernel_ipsec_sa_id_t *id,
 	kernel_ipsec_query_sa_t *data, uint64_t *bytes, uint64_t *packets,
-	time_t *time)
+	time_t *use_time)
 {
 	netlink_buf_t request;
 	struct nlmsghdr *out = NULL, *hdr;
@@ -2232,11 +2239,17 @@ METHOD(kernel_ipsec_t, query_sa, status_t,
 		{
 			*packets = sa->curlft.packets;
 		}
-		if (time)
-		{	/* curlft contains an "use" time, but that contains a timestamp
-			 * of the first use, not the last. Last use time must be queried
-			 * on the policy on Linux */
-			*time = 0;
+		if (use_time)
+		{
+			if (this->sa_use_time && sa->curlft.use_time)
+			{
+				*use_time = time_monotonic(NULL) - (time(NULL) - sa->curlft.use_time);
+			}
+			else
+			{	/* on older kernels, the "use" time contains the timestamp
+				 * of the first use, not the last */
+				*use_time = 0;
+			}
 		}
 		status = SUCCESS;
 	}
@@ -3664,6 +3677,29 @@ static void setup_spd_hash_thresh(private_kernel_netlink_ipsec_t *this,
 	}
 }
 
+/**
+ * Check for kernel features (currently only via version number)
+ */
+static void check_kernel_features(private_kernel_netlink_ipsec_t *this)
+{
+	struct utsname utsname;
+	int a, b, c;
+
+	if (uname(&utsname) == 0)
+	{
+		switch(sscanf(utsname.release, "%d.%d.%d", &a, &b, &c))
+		{
+			case 2:
+			case 3:
+				/* before 5.17, the last use time on SAs was only set once */
+				this->sa_use_time = a > 5 || (a == 5 && b >= 17);
+				break;
+			default:
+				break;
+		}
+	}
+}
+
 /*
  * Described in header.
  */
@@ -3709,6 +3745,8 @@ kernel_netlink_ipsec_t *kernel_netlink_ipsec_create()
 						"%s.plugins.kernel-netlink.set_proto_port_transport_sa",
 						FALSE, lib->ns),
 	);
+
+	check_kernel_features(this);
 
 	if (streq(lib->ns, "starter"))
 	{	/* starter has no threads, so we do not register for kernel events */
